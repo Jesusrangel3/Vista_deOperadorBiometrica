@@ -139,9 +139,7 @@ const PROXY_URL = "http://localhost:3001";
 
 export async function fetchSamsaraDrivers() {
   try {
-    const res = await fetch(`${PROXY_URL}/api/drivers`, {
-      signal: AbortSignal.timeout(8000),
-    });
+    const res = await fetch(`${PROXY_URL}/api/drivers`);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const json = await res.json();
     if (json.success && json.data?.length > 0) {

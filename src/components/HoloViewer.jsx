@@ -1,4 +1,4 @@
-import { Suspense, useRef, useMemo, forwardRef } from "react";
+import { Suspense, useRef, useMemo, forwardRef, useState } from "react";
 import { Canvas, useFrame } from "@react-three/fiber";
 import { OrbitControls, Grid, Float, useGLTF, Html } from "@react-three/drei";
 import * as THREE from "three";
@@ -360,12 +360,251 @@ const RealisticOperator = forwardRef(({ color, driver }, externalRef) => {
   );
 });
 
+// ============================================================
+// MODELO ANATÓMICO (Texturizado IA con Mapa de Calor)
+// ============================================================
+const AnatomyModel = forwardRef(({ driver }, externalRef) => {
+  const internalGroup = useRef();
+  const group = externalRef || internalGroup;
+  
+  // Clonar la escena para evitar mutar el caché original de ThreeJS
+  const { scene: originalScene } = useGLTF("/models/Meshy_AI_Anatomy_Illustration_0618034359_texture.glb");
+  const scene = useMemo(() => originalScene.clone(true), [originalScene]);
+
+  const { center, size, min } = useMemo(() => {
+    const box = new THREE.Box3().setFromObject(scene);
+    const center = new THREE.Vector3();
+    box.getCenter(center);
+    const size = new THREE.Vector3();
+    box.getSize(size);
+    return { center, size, min: box.min };
+  }, [scene]);
+
+  useFrame((_, delta) => {
+    if (group.current) {
+        group.current.rotation.y += delta * 0.15;
+        // La escala se mantiene constante; la obesidad se maneja a nivel de vértices (inflación de normales)
+        const baseScale = 1.8 / size.y;
+        group.current.scale.set(baseScale, baseScale, baseScale);
+    }
+  });
+
+  const scale = 1.8 / size.y; // Escala inicial
+
+  // Mapa de Calor y Deformación Anatómica Dinámica
+  const lastStatsRef = useRef("");
+  useFrame(() => {
+    const current = driver?.current || { bpSys: 120, bpDia: 80, bmi: 22.0, hr: 70, fatigue: 15, stress: 10 };
+    const fatStat = fatigueStatus(current.fatigue);
+    const hrStat = hrStatus(current.hr);
+    const bpStat = bpStatus(current.bpSys, current.bpDia);
+    const bmiStat = bmiStatus(current.bmi);
+    
+    // Solo actualizar si cambian los estados médicos o el IMC exacto
+    const statsStr = `${fatStat}-${hrStat}-${bpStat}-${bmiStat}-${current.bmi}`;
+    if (lastStatsRef.current === statsStr) return;
+    lastStatsRef.current = statsStr;
+
+    const heatNodes = [
+      { y: 0.90, status: fatStat, radius: 0.15 },
+      { y: 0.70, status: hrStat, radius: 0.15 },
+      { y: 0.60, status: bpStat, radius: 0.15 },
+      { y: 0.45, status: bmiStat, radius: 0.15 }
+    ];
+
+    const getStatusColor = (status) => {
+        if (status === 'critical') return new THREE.Color("#ff0b3a");
+        if (status === 'warn') return new THREE.Color("#fbbf24");
+        return new THREE.Color("#ffffff");
+    };
+
+    // Parámetros de obesidad (BMI por encima de 24)
+    const excessBmi = Math.max(0, current.bmi - 24);
+
+    scene.traverse((child) => {
+      if (child.isMesh) {
+        if (!child.userData.materialConfigured) {
+            child.material = child.material.clone();
+            child.material.vertexColors = true;
+            child.material.color.setHex(0xffffff);
+            child.userData.materialConfigured = true;
+        }
+
+        // Pérdida de definición muscular para cuerpos robustos
+        child.material.roughness = Math.min(0.9, 0.5 + (excessBmi * 0.02)); // Más opaco/suave
+        child.material.metalness = Math.max(0.0, 0.1 - (excessBmi * 0.005));
+        child.material.envMapIntensity = Math.max(0.5, 1.5 - (excessBmi * 0.05));
+        child.material.emissive = new THREE.Color(0x111111);
+        
+        if (child.material.normalScale) {
+            // Suavizar el mapa de normales (elimina los "cuadritos" y músculos marcados)
+            const normalStr = Math.max(0.1, 1.0 - (excessBmi * 0.06));
+            child.material.normalScale.setScalar(normalStr);
+        }
+
+        const geometry = child.geometry;
+        
+        // Guardar posiciones y normales originales si no lo hemos hecho (Protección HMR)
+        if (!geometry.attributes.basePosition) {
+            geometry.setAttribute('basePosition', geometry.attributes.position.clone());
+        }
+        if (!geometry.attributes.baseNormal) {
+            if (!geometry.attributes.normal) geometry.computeVertexNormals();
+            geometry.setAttribute('baseNormal', geometry.attributes.normal.clone());
+        }
+        
+        const positions = geometry.attributes.position.array;
+        const basePositions = geometry.attributes.basePosition.array;
+        const baseNormals = geometry.attributes.baseNormal.array;
+        
+        if (!geometry.attributes.color) {
+            geometry.setAttribute('color', new THREE.BufferAttribute(new Float32Array(positions.length), 3));
+        }
+        const colorsArray = geometry.attributes.color.array;
+
+        if (!geometry.boundingBox) geometry.computeBoundingBox();
+        const gMinY = geometry.boundingBox.min.y;
+        const gMaxY = geometry.boundingBox.max.y;
+        const height = gMaxY - gMinY || 1;
+
+        let colorIndex = 0;
+        for (let i = 0; i < positions.length; i += 3) {
+            // 1. Calcular color de vértice (Mapa de Calor)
+            const y = basePositions[i + 1];
+            const ny = (y - gMinY) / height;
+            
+            let vColor = new THREE.Color("#ffffff");
+            let maxInfluence = 0;
+            let targetHeatColor = null;
+
+            for (let node of heatNodes) {
+                if (node.status !== 'ok') {
+                    const dist = Math.abs(ny - node.y);
+                    if (dist < node.radius) {
+                        const rawIntensity = 1 - (dist / node.radius);
+                        const smoothIntensity = rawIntensity * rawIntensity * (3 - 2 * rawIntensity);
+                        if (smoothIntensity > maxInfluence) {
+                            maxInfluence = smoothIntensity;
+                            targetHeatColor = getStatusColor(node.status);
+                        }
+                    }
+                }
+            }
+
+            if (maxInfluence > 0 && targetHeatColor) {
+                vColor.lerpHSL(targetHeatColor, maxInfluence * 0.9);
+            }
+            
+            colorsArray[colorIndex++] = vColor.r;
+            colorsArray[colorIndex++] = vColor.g;
+            colorsArray[colorIndex++] = vColor.b;
+
+            // 2. Deformación Realista de Todo el Cuerpo (Inflado por Normales)
+            let bx = basePositions[i];
+            let by = basePositions[i + 1];
+            let bz = basePositions[i + 2];
+            
+            let nx = baseNormals[i];
+            let ny_norm = baseNormals[i + 1];
+            let nz = baseNormals[i + 2];
+
+            if (excessBmi > 0) {
+                // Curvas Gaussianas para distribución de grasa (Patrón Masculino)
+                // Panza (Y~0.50): Acumulación extrema (Gut)
+                const belly = Math.exp(-Math.pow((ny - 0.50) / 0.12, 2.0)) * 2.2;
+                // Pecho y espalda alta (Y~0.70): Acumulación media
+                const chest = Math.exp(-Math.pow((ny - 0.70) / 0.15, 2.0)) * 0.8;
+                // Muslos/Caderas (Y~0.35): Acumulación muy baja (Evita el efecto extraño de "saddlebags")
+                const thighs = Math.exp(-Math.pow((ny - 0.35) / 0.12, 2.0)) * 0.4;
+                // Papada (Y~0.85): Acumulación leve
+                const neck = Math.exp(-Math.pow((ny - 0.85) / 0.08, 2.0)) * 0.3;
+                
+                let inflationFactor = belly + chest + thighs + neck;
+                
+                // Máscara Basada en Bounding Box (Aísla las manos a prueba de fallos)
+                // En una pose A, las manos son siempre los puntos más anchos de la malla (extremos X)
+                // nx_x va de 0.0 (punta de los dedos izquierdos) a 1.0 (punta de los dedos derechos)
+                const nx_x = (bx - geometry.boundingBox.min.x) / (geometry.boundingBox.max.x - geometry.boundingBox.min.x);
+                
+                let handMask = 1.0;
+                
+                // Solo protegemos por debajo de los hombros (ny < 0.70)
+                if (ny < 0.70) {
+                    if (nx_x < 0.25) {
+                        // Brazo Izquierdo (0% a 25% del ancho total)
+                        let distFromEdge = nx_x;
+                        if (distFromEdge < 0.10) {
+                            handMask = 0.0; // El 10% más externo (Manos y dedos) tiene 0.0 inflación absoluta
+                        } else {
+                            // Del 10% al 25% (Antebrazo) se suaviza la inflación
+                            let falloff = 1.0 - ((distFromEdge - 0.10) / 0.15);
+                            let penalty = falloff * falloff * (3 - 2 * falloff);
+                            handMask = 1.0 - penalty;
+                        }
+                    } else if (nx_x > 0.75) {
+                        // Brazo Derecho (75% a 100% del ancho total)
+                        let distFromEdge = 1.0 - nx_x;
+                        if (distFromEdge < 0.10) {
+                            handMask = 0.0; // Manos y dedos derechos en 0.0
+                        } else {
+                            let falloff = 1.0 - ((distFromEdge - 0.10) / 0.15);
+                            let penalty = falloff * falloff * (3 - 2 * falloff);
+                            handMask = 1.0 - penalty;
+                        }
+                    }
+                }
+                
+                inflationFactor *= handMask;
+                
+                const pushAmount = inflationFactor * excessBmi * 0.0015 * height;
+                
+                // Expansión anisotrópica:
+                // Prioriza el empuje Frontal (Z) y reduce el empuje Lateral (X).
+                // Esto genera una "panza de cerveza" realista en lugar de inflarlo como un globo esférico.
+                bx += nx * pushAmount * 0.5;   // 50% expansión hacia los lados (evita caderas anchas)
+                by += ny_norm * pushAmount * 0.2;  // 20% expansión hacia arriba/abajo
+                bz += nz * pushAmount * 1.3;   // 130% expansión hacia el frente/atrás (panza)
+                
+                // Gravedad: La panza frontal cuelga hacia abajo
+                // Es vital multiplicar por handMask para evitar que los dedos (que están a la misma altura que la panza) se "derritan" hacia abajo.
+                if (nz > 0.4 && belly > 0.5) { 
+                    by -= belly * excessBmi * 0.001 * height * handMask; 
+                }
+            }
+
+            positions[i] = bx;
+            positions[i + 1] = by;
+            positions[i + 2] = bz;
+        }
+        
+        geometry.attributes.color.needsUpdate = true;
+        geometry.attributes.position.needsUpdate = true;
+        geometry.computeVertexNormals(); // Recalcular iluminación para la panza nueva
+      }
+    });
+  });
+
+  return (
+    <group ref={group} position={[0, -1.31, 0]} scale={scale}>
+      {/* Luces extra dedicadas solo para el modelo anatómico para darle nitidez y brillo */}
+      <ambientLight intensity={1.2} />
+      <directionalLight position={[0, 2, 5]} intensity={1.5} color="#ffffff" />
+      <directionalLight position={[-3, 0, -3]} intensity={0.5} color="#4fc3f7" />
+      
+      {/* El ajuste -min.y en el eje Y coloca sus pies exactamente en Y=0 del grupo local */}
+      <primitive object={scene} position={[-center.x, -min.y, -center.z]} />
+    </group>
+  );
+});
+
 useGLTF.preload("/models/male.glb");
+useGLTF.preload("/models/Meshy_AI_Anatomy_Illustration_0618034359_texture.glb");
 
 const statusHex = { ok: "#10b981", warn: "#fbbf24", critical: "#f87171" };
 
 export default function HoloViewer({ status = "ok", driverName, driver }) {
   const modelRef = useRef();
+  const [anatomyMode, setAnatomyMode] = useState(false);
   const color = statusHex[status] ?? "#22d3ee";
 
   const handleExportGLB = async () => {
@@ -395,6 +634,8 @@ export default function HoloViewer({ status = "ok", driverName, driver }) {
     toRemove.forEach(c => c.parent?.remove(c));
 
     // Convertir todas las mallas en LineSegments (Wireframe) reducido con Mapa de Calor
+    // SOLO para el holograma de alambre. El modelo anatómico se exporta con su malla y textura original.
+    if (!anatomyMode) {
     const replacements = [];
     exportModel.traverse((child) => {
       if (child.isMesh) {
@@ -508,6 +749,7 @@ export default function HoloViewer({ status = "ok", driverName, driver }) {
         parent.add(newChild);
       }
     });
+    } // Fin del if (!anatomyMode)
 
     exporter.parse(
       exportModel,
@@ -538,6 +780,15 @@ export default function HoloViewer({ status = "ok", driverName, driver }) {
         
         <div className="absolute top-4 right-4 z-10 flex gap-4 items-center">
           <button 
+            onClick={() => setAnatomyMode(!anatomyMode)}
+            className={`pointer-events-auto transition-all px-2 py-1 rounded-sm border flex items-center gap-1.5 text-xs font-mono cursor-pointer ${anatomyMode ? 'bg-[#0891b2]/30 text-white border-[#0891b2]' : 'text-[#0891b2] hover:text-[#06b6d4] hover:bg-[#0891b2]/20 bg-[#0891b2]/10 border-[#0891b2]/30'}`}
+            title="Alternar vista anatómica / wireframe"
+          >
+            <Brain size={13} />
+            <span>Anatomía</span>
+          </button>
+
+          <button 
             onClick={handleExportGLB}
             className="pointer-events-auto text-[#0891b2] hover:text-[#06b6d4] hover:bg-[#0891b2]/20 transition-all bg-[#0891b2]/10 px-2 py-1 rounded-sm border border-[#0891b2]/30 flex items-center gap-1.5 text-xs font-mono cursor-pointer"
             title="Exportar humanoide 3D actual"
@@ -567,9 +818,13 @@ export default function HoloViewer({ status = "ok", driverName, driver }) {
         <pointLight position={[5, 8, 5]} intensity={0.9} />
         <pointLight position={[-5, 5, -3]} intensity={0.4} color="#4fc3f7" />
         <Suspense fallback={null}>
-          <Float speed={1.3} rotationIntensity={0} floatIntensity={0.3}>
+          <Float speed={1.5} rotationIntensity={0.2} floatIntensity={0.5}>
             <FlooringRings color={color} />
-            <RealisticOperator color={color} driver={driver} ref={modelRef} />
+            {anatomyMode ? (
+              <AnatomyModel ref={modelRef} driver={driver} />
+            ) : (
+              <RealisticOperator color={color} driver={driver} ref={modelRef} />
+            )}
           </Float>
           <Grid
             position={[0, -1.31, 0]}

@@ -151,7 +151,7 @@ function FlooringRings({ color }) {
 const RealisticOperator = forwardRef(({ color, driver }, externalRef) => {
   const internalGroup = useRef();
   const group = externalRef || internalGroup;
-  const { scene } = useGLTF("/models/male.glb");
+  const { scene } = useGLTF("/models/male_optimized.glb");
 
   useMemo(() => {
     scene.traverse((o) => {
@@ -368,7 +368,7 @@ const AnatomyModel = forwardRef(({ driver }, externalRef) => {
   const group = externalRef || internalGroup;
   
   // Clonar la escena para evitar mutar el caché original de ThreeJS
-  const { scene: originalScene } = useGLTF("/models/Meshy_AI_Anatomy_Illustration_0618034359_texture.glb");
+  const { scene: originalScene } = useGLTF("/models/Meshy_AI_Anatomy_Illustration_0618034359_texture_optimized.glb");
   const scene = useMemo(() => originalScene.clone(true), [originalScene]);
 
   const { center, size, min } = useMemo(() => {
@@ -597,8 +597,8 @@ const AnatomyModel = forwardRef(({ driver }, externalRef) => {
   );
 });
 
-useGLTF.preload("/models/male.glb");
-useGLTF.preload("/models/Meshy_AI_Anatomy_Illustration_0618034359_texture.glb");
+useGLTF.preload("/models/male_optimized.glb");
+useGLTF.preload("/models/Meshy_AI_Anatomy_Illustration_0618034359_texture_optimized.glb");
 
 const statusHex = { ok: "#10b981", warn: "#fbbf24", critical: "#f87171" };
 
@@ -766,7 +766,7 @@ export default function HoloViewer({ status = "ok", driverName, driver }) {
         URL.revokeObjectURL(url);
       },
       (error) => { console.error("Error al exportar:", error); },
-      { binary: true }
+      { binary: true, maxTextureSize: 1024 }
     );
   };
 
